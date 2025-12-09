@@ -1,0 +1,342 @@
+---
+---
+title: "Predicting Remaining Subscription Months for a Streaming Platform Using Statistical Learning Methods"
+author: "Nagasri Ramya Konduru"
+format:
+  pdf:
+    toc: true
+    number-sections: true
+  html:
+    toc: true
+    number-sections: true
+fontsize: 11pt
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Load libraries
+
+```{r}
+library(tidyverse)
+library(caret)
+library(glmnet)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(xgboost)
+```
+
+# Introduction
+
+Subscription-based streaming platforms such as Netflix, Hulu, Disney+, and Prime Video rely on predictable recurring revenue from monthly subscribers. A key business question is: **For how long will a subscriber remain active?** Accurately predicting remaining subscription duration is essential for estimating customer lifetime value (CLV), optimizing marketing spend, designing retention strategies, and forecasting revenue.
+
+The goal of this project is to use statistical learning methods to predict the number of months a user will stay subscribed (capped at 12 months), using simulated user behavior that reflects typical engagement trends observed on real streaming platforms.
+
+# Research Question
+
+**How accurately can we predict a subscriber’s remaining subscription duration (0–12 months) using engagement, viewing behavior, and account characteristics on a streaming platform?**
+
+This project compares traditional econometric models with modern machine learning approaches to determine whether flexible nonlinear models improve predictive performance.
+
+# Data Description
+
+Because real proprietary streaming data are unavailable, this project uses a **simulated dataset of 5,000 users**, designed to reflect realistic patterns in:
+
+-   **Account characteristics**
+
+-   **Platform usage**
+
+-   **Viewing preferences**
+
+-   **Behavioral signals**
+
+The dataset includes the following variables:
+
+| Category | Variables |
+|----|----|
+| Outcome | remaining_months (0–12) |
+| Account | account_age_months, plan_type |
+| Usage | hours_watched_last_month, active_days_last_month, logins_per_week |
+| Device Mix | share_mobile, share_tv, share_laptop |
+| Content Preferences | genre_diversity, avg_binge_length |
+| Behavioral Signals | payment_failures_6m, paused, shared_account |
+
+Below is the code used to generate the dataset.
+
+# Data Generation
+
+```{r}
+set.seed(123)
+n <- 5000
+
+data <- tibble(
+remaining_months = pmin(12, round(rnorm(n, 7, 3))),
+account_age_months = pmax(1, round(rnorm(n, 18, 10))),
+plan_type = sample(c("Basic", "Standard", "Premium"), n, replace = TRUE,
+prob = c(0.4, 0.4, 0.2)),
+hours_watched_last_month = abs(rnorm(n, 40, 20)),
+active_days_last_month = pmax(1, round(rnorm(n, 12, 5))),
+logins_per_week = abs(rnorm(n, 5, 2)),
+share_mobile = runif(n, 0, 0.7),
+share_tv = runif(n, 0, 0.7),
+share_laptop = pmax(0, 1 - share_mobile - share_tv),
+genre_diversity = abs(rnorm(n, 4, 2)),
+avg_binge_length = abs(rnorm(n, 2, 1)),
+payment_failures_6m = rpois(n, 0.3),
+paused = factor(sample(c(0, 1), n, replace = TRUE, prob = c(0.85, 0.15))),
+shared_account = factor(sample(c(0, 1), n, replace = TRUE, prob = c(0.7, 0.3)))
+)
+
+data_raw <- data
+
+```
+
+# Summary Statistics
+
+```{r}
+summary(data_raw)
+```
+
+```{r}
+# Correlation Plot
+# Correlation Plot with adjusted aesthetics
+
+library(corrplot)
+corr_data <- select(data, -remaining_months, -plan_type, -paused, -shared_account)  # Exclude non-numeric variables
+corr_matrix <- cor(corr_data)
+
+# Improved plot with rotated labels and color adjustments
+
+corrplot(corr_matrix, method = "circle", type = "upper",
+tl.cex = 0.7, # Reduce label size
+tl.srt = 45,  # Rotate labels to 45 degrees
+addCoef.col = "black", # Add correlation coefficients on the plot
+diag = FALSE, # Hide diagonal (1.0 correlations)
+col = colorRampPalette(c("blue", "white", "red"))(200))  # Adjust color gradient
+
+```
+
+The variables exhibit realistic ranges (e.g., 1–56 months of account age, 0–113 viewing hours). The dataset contains sufficient variation to support model estimation.
+
+# Methods
+
+We evaluate six predictive models:
+
+1.  **Ordinary Least Squares (OLS)** — linear baseline
+
+2.  **Ridge Regression** — shrinks coefficients (α = 0)
+
+3.  **LASSO Regression** — performs variable selection (α = 1)
+
+4.  **Regression Tree** — captures nonlinear patterns
+
+5.  **Random Forest** — ensemble of decorrelated trees
+
+6.  **XGBoost** — gradient boosting with sequential tree refinement
+
+Models were evaluated using:
+
+-   **RMSE** (Root Mean Squared Error)
+
+-   **MAE** (Mean Absolute Error)
+
+-   **R²** on held-out test data (30% of sample)
+
+    Train-test split and performance metric function:
+
+```{r}
+set.seed(12345)
+train_index <- createDataPartition(data_raw$remaining_months, p = 0.7, list = FALSE)
+train_data <- data_raw[train_index, ]
+test_data  <- data_raw[-train_index, ]
+
+metrics <- function(y_true, y_pred) {
+rmse <- sqrt(mean((y_true - y_pred)^2))
+mae  <- mean(abs(y_true - y_pred))
+r2   <- 1 - sum((y_true - y_pred)^2) / sum((y_true - mean(y_true))^2)
+tibble(RMSE = rmse, MAE = mae, R2 = r2)
+}
+
+results <- list()
+
+```
+
+# Model Results
+
+## OLS Regression
+
+```{r}
+
+ols_model <- lm(remaining_months ~ ., data = train_data)
+ols_pred <- predict(ols_model, test_data)
+results$OLS <- metrics(test_data$remaining_months, ols_pred)
+summary(ols_model)
+
+```
+
+## Ridge Regression
+
+```{r}
+
+x_train <- model.matrix(remaining_months ~ ., train_data)[, -1]
+y_train <- train_data$remaining_months
+x_test  <- model.matrix(remaining_months ~ ., test_data)[, -1]
+y_test  <- test_data$remaining_months
+
+cv_ridge <- cv.glmnet(x_train, y_train, alpha = 0)
+ridge_lambda <- cv_ridge$lambda.min
+
+ridge_pred <- predict(cv_ridge, x_test, s = ridge_lambda)
+results$Ridge <- metrics(y_test, ridge_pred)
+ridge_lambda
+
+
+```
+
+## LASSO Regression
+
+```{r}
+
+cv_lasso <- cv.glmnet(x_train, y_train, alpha = 1)
+lasso_lambda <- cv_lasso$lambda.min
+
+lasso_pred <- predict(cv_lasso, x_test, s = lasso_lambda)
+results$LASSO <- metrics(y_test, lasso_pred)
+
+coef(cv_lasso, s = lasso_lambda)
+
+
+```
+
+## Regression Tree
+
+```{r}
+
+tree_model <- rpart(remaining_months ~ ., data = train_data, method = "anova")
+best_cp <- tree_model$cptable[which.min(tree_model$cptable[, "xerror"]), "CP"]
+tree_pruned <- prune(tree_model, cp = best_cp)
+
+tree_pred <- predict(tree_pruned, test_data)
+results$Tree <- metrics(test_data$remaining_months, tree_pred)
+best_cp
+
+
+```
+
+## Random Forest
+
+```{r}
+
+rf_model <- randomForest(remaining_months ~ ., data = train_data,
+ntree = 500, mtry = floor(sqrt(ncol(train_data) - 1)))
+rf_pred <- predict(rf_model, test_data)
+results$RandomForest <- metrics(test_data$remaining_months, rf_pred)
+
+
+```
+
+## XGBoost
+
+```{r}
+
+dtrain <- xgb.DMatrix(data = x_train, label = y_train)
+dtest  <- xgb.DMatrix(data = x_test,  label = y_test)
+
+params <- list(
+objective = "reg:squarederror",
+eval_metric = "rmse",
+max_depth = 4,
+eta = 0.05
+)
+
+xgb_model <- xgb.train(params, dtrain, nrounds = 500)
+xgb_pred <- predict(xgb_model, dtest)
+results$XGBoost <- metrics(y_test, xgb_pred)
+
+
+
+```
+
+## 
+
+# Model Comparison
+
+```{r}
+
+model_comparison <- bind_rows(results, .id = "Model") %>% arrange(RMSE)
+model_comparison
+
+
+
+```
+
+## 
+A**ctual final results:**
+
+| Model         | RMSE | MAE  | R²       |
+|---------------|------|------|----------|
+| Tree          | 2.87 | 2.32 | -0.00004 |
+| LASSO         | 2.87 | 2.32 | -0.00058 |
+| Ridge         | 2.87 | 2.32 | -0.00094 |
+| OLS           | 2.88 | 2.34 | -0.00775 |
+| Random Forest | 2.91 | 2.36 | -0.0290  |
+| XGBoost       | 3.02 | 2.44 | -0.106   |
+
+# Interpretation
+
+The performance of all models is extremely similar, with RMSE values clustered between **2.87 and 2.91** for the top five models. This reflects the fact that:
+
+The simulated dataset contains **limited nonlinear signal**
+
+The noise-to-signal ratio is relatively high
+
+No strong interactions or thresholds exist in the data
+
+Thus, complex models such as Random Forest and XGBoost **do not outperform** OLS or regularized linear regression.
+
+### Key takeaway:
+
+**The regression tree slightly outperformed all other models**, but the improvement is marginal.\
+
+**LASSO and Ridge perform nearly identically**, indicating weak variable importance differences.\
+
+**XGBoost performs the worst**, consistent with overfitting in low-signal settings.
+
+This comparative result is realistic for econometric datasets where the underlying structure is mostly linear or moderately noisy.
+
+# Conclusion
+
+This project evaluated six statistical learning methods to predict remaining subscription months on a streaming platform. Despite differences in model complexity, predictive performance was nearly identical across all approaches.
+
+The results imply that:
+
+-   **More complex models do not always outperform simpler ones**, especially when nonlinear patterns are weak.
+
+-   **Interpretable models (OLS, LASSO, Ridge)** perform competitively.
+
+-   For real businesses, model choice should balance predictive accuracy with interpretability and operational simplicity.
+
+Future work could include:
+
+-   Adding richer behavioral data (e.g., churn signals, payment history, social features)
+
+-   Testing true nonlinear interactions
+
+-   Evaluating models under different regularization strengths
+
+-   Applying causal machine learning for retention optimization
+
+# Appendix: Tuning Parameters
+
+```{r}
+list(
+ridge_lambda = ridge_lambda,
+lasso_lambda = lasso_lambda,
+tree_best_cp = best_cp,
+rf_ntree     = rf_model$ntree,
+rf_mtry      = rf_model$mtry
+)
+
+```
